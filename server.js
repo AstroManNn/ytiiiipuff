@@ -11,7 +11,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // 👇 ВСТАВЬ СВОЮ ССЫЛКУ!
-const SERVER_URL = 'https://ytiiiipuff-production.up.railway.app'; 
+const SERVER_URL = 'https://ttrippuufback-production.up.railway.app'; 
 
 app.use(cors());
 app.use(express.json());
@@ -109,13 +109,13 @@ app.post('/api/admin/product', upload.single('photo'), async (req, res) => {
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         if (!req.file) return res.status(400).json({ error: 'No photo uploaded' });
 
-// Отправляем фото боту (в чат админа), чтобы получить file_id
+        // Отправляем фото боту (в чат админа), чтобы получить file_id
         // Мы используем первого админа из списка как "хранилище"
         const storageChatId = getAdmins()[0]; 
         
         const photoMsg = await bot.sendPhoto(storageChatId, req.file.buffer, { caption: `New product: ${name}` });
         const fileId = photoMsg.photo[photoMsg.photo.length - 1].file_id;
-        const internalLink =legramBot = require('node-telegram-bo
+        const internalLink = `${SERVER_URL}/api/image/${fileId}`;
 
         await pool.query(
             'INSERT INTO products (name, category, description, price, purchase_price, stock, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7)',
@@ -210,9 +210,7 @@ app.get('/api/admin/stats', async (req, res) => {
 
         const now = new Date();
         const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-        const endOfMonth = new Date(now.
-
-getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+        const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
 
         const ordersRes = await pool.query(
             "SELECT details, total_price FROM orders WHERE status = 'completed' AND created_at >= $1 AND created_at <= $2",
@@ -318,9 +316,7 @@ app.get('/api/faq', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.
-
-get('/api/cart/:userId', async (req, res) => {
+app.get('/api/cart/:userId', async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT c.product_id, c.quantity, p.name, p.price, p.image_url 
@@ -372,19 +368,10 @@ app.post('/api/order', async (req, res) => {
         items.forEach(item => {
             const sum = item.price * item.quantity;
             totalPrice += sum;
-            itemsListText +=s);
-    } catch (e) { res.status(404).send('Not 
+            itemsListText += `- ${item.name} x${item.quantity} = ${sum}₽\n`;
         });
-        const userLink = user.username ?ire('cors');
-const { :onst express = require('express');
-const cors = requ
-        const orderText =xpress');
-const cors = require('cors');
-const { Pool } = require('pg');
-const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
-const multer = require('multer'); // Для загрузки фото
-const FormData = requi
+        const userLink = user.username ? `@${user.username}` : `[${user.name}](tg://user?id=${user.telegram_id})`;
+        const orderText = `📦 *НОВЫЙ ЗАКАЗ*\n\n👤 *Клиент:* ${user.name}\n🔗 *Ссылка:* ${userLink}\n📞 *Телефон:* ${user.phone}\n\n📍 *Адрес:* \`${address}\`\n💬 *Комментарий:* ${comment || 'Нет'}\n\n🛒 *Товары:*\n${itemsListText}\n💰 *ИТОГО: ${totalPrice}₽*`;
         const newOrder = await pool.query(
             'INSERT INTO orders (user_telegram_id, details, total_price, address, comment, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
             [userId, JSON.stringify(items), totalPrice, address, comment, 'active']
@@ -392,9 +379,12 @@ const FormData = requi
         const orderId = newOrder.rows[0].id;
         await pool.query('DELETE FROM cart_items WHERE user_telegram_id = $1', [userId]);
         getAdmins().forEach(adminId => {
-            if (adminId) bot.sendMessage(adminId, orderText +а Multer (храним фото в памяти перед отправкой в ТГ)
-const upload = mu { parse_mode: 'Markdown' }).catch(e => console.error(e));
+            if (adminId) bot.sendMessage(adminId, orderText + `\n🆔 *ID:* ${orderId}\n\n🤖 Зайдите в админ-панель для управления.`, { parse_mode: 'Markdown' }).catch(e => console.error(e));
         });
         res.json({ success: true });
-    } catch (err) { res.status(500).
+    } catch (err) { res.status(500).json({ success: false }); }
+});
 
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
