@@ -165,14 +165,25 @@ app.post('/api/admin/product/:id/image', upload.single('photo'), async (req, res
     } catch (err) { console.error(err); res.status(500).json({ error: 'Image upload error' }); }
 });
 
-// 2. Удалить товар
+// 2. Удалить товар (ИСПРАВЛЕНО: удаляет и из корзин тоже)
 app.delete('/api/admin/product/:id', async (req, res) => {
     try {
-        const userId = req.headers['user-id'];
+        const userId = req.headers['user-id']; 
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
-        await pool.query('DELETE FROM products WHERE id = $1', [req.params.id]);
+
+        const productId = req.params.id;
+
+        // 1. Сначала удаляем этот товар из всех корзин пользователей
+        await pool.query('DELETE FROM cart_items WHERE product_id = $1', [productId]);
+
+        // 2. Теперь удаляем сам товар
+        await pool.query('DELETE FROM products WHERE id = $1', [productId]);
+
         res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: 'Delete error' }); }
+    } catch (err) { 
+        console.error(err);
+        res.status(500).json({ error: 'Delete error: ' + err.message }); 
+    }
 });
 
 // 2.1 Изменить сток
@@ -392,3 +403,4 @@ app.post('/api/order', async (req, res) => {
 });
 
 app.listen(PORT, () => { console.log(`Server running on port ${PORT}`); });
+
