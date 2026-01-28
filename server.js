@@ -1,4 +1,3 @@
-> ^:
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -110,7 +109,6 @@ app.post('/api/admin/product', upload.single('photo'), async (req, res) => {
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         if (!req.file) return res.status(400).json({ error: 'No photo uploaded' });
 
-> ^:
 // Отправляем фото боту (в чат админа), чтобы получить file_id
         // Мы используем первого админа из списка как "хранилище"
         const storageChatId = getAdmins()[0]; 
@@ -214,7 +212,6 @@ app.get('/api/admin/stats', async (req, res) => {
         const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
         const endOfMonth = new Date(now.
 
-> ^:
 getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
 
         const ordersRes = await pool.query(
@@ -323,7 +320,6 @@ app.get('/api/faq', async (req, res) => {
 
 app.
 
-> ^:
 get('/api/cart/:userId', async (req, res) => {
     try {
         const result = await pool.query(`
@@ -401,3 +397,4 @@ const upload = mu { parse_mode: 'Markdown' }).catch(e => console.error(e));
         });
         res.json({ success: true });
     } catch (err) { res.status(500).
+
