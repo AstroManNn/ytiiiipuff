@@ -251,32 +251,87 @@ async function showOrders(chatId, status) {
     } catch (e) { console.error(e); }
 }
 
-// Загрузка фото
+// --- ОБРАБОТКА ФОТО (НАДЕЖНАЯ ЗАГРУЗКА) ---
 bot.on('photo', async (msg) => {
     const chatId = msg.chat.id;
     const state = adminStates[chatId];
+
     if (state && state.step === 'WAITING_PHOTO') {
-        bot.sendMessage(chatId, '⏳ Загрузка...');
+        bot.sendMessage(chatId, '⏳ Обработка и загрузка фото... (это может занять пару секунд)');
+        
         try {
+            // 1. Получаем ссылку и скачиваем фото в буфер (память)
             const fileId = msg.photo[msg.photo.length - 1].file_id;
             const fileLink = await bot.getFileLink(fileId);
-            const imageResponse = await axios({ url: fileLink, responseType: 'stream' });
             
-            const form = new FormData();
-            form.append('file', imageResponse.data, { filename: 'img.jpg' });
-            
-            const uploadRes = await axios.post('https://telegra.ph/upload', form, { headers: { ...form.getHeaders() } });
-            const permLink = 'https://telegra.ph' + uploadRes.data[0].src;
+            // Скачиваем как ArrayBuffer
+            const response = await axios.get(fileLink, { responseType: 'arraybuffer' });
+            const buffer = Buffer.from(response.data);
 
+            let permLink = null;
+
+            // 2. Попытка №1: Загрузка на Telegraph
+            try {
+                const form = new FormData();
+                form.append('file', buffer, { filename: 'image.jpg', contentType: 'image/jpeg' });
+
+                const uploadRes = await axios.post('https://telegra.ph/upload', form, {
+                    headers: {
+                        ...form.getHeaders(),
+                        // Притворяемся браузером, чтобы не заблокировали
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    }
+                });
+
+                if (uploadRes.data && uploadRes.data[0] && uploadRes.data[0].src) {
+                    permLink = 'https://telegra.ph' + uploadRes.data[0].src;
+                    console.log('✅ Загружено на Telegraph:', permLink);
+                }
+            } catch (telegraphError) {
+                console.error('⚠️ Telegraph error (пробую резерв):', telegraphError.message);
+            }
+
+            // 3. Попытка №2: Загрузка на Catbox (если Telegraph не сработал)
+            if (!permLink) {
+                try {
+                    const formCat = new FormData();
+                    formCat.append('reqtype', 'fileupload');
+                    formCat.append('fileToUpload', buffer, { filename: 'image.jpg', contentType: 'image/jpeg' });
+
+                    const catRes = await axios.post('https://catbox.moe/user/api.php', formCat, {
+                        headers: { ...formCat.getHeaders() }
+                    });
+                    
+                    if (catRes.data && catRes.data.startsWith('http')) {
+                        permLink = catRes.data;
+                        console.log('✅ Загружено на Catbox:', permLink);
+                    }
+                } catch (catError) {
+                    console.error('❌ Catbox error:', catError.message);
+                }
+            }
+
+            // 4. Если ничего не вышло
+            if (!permLink) {
+                return bot.sendMessage(chatId, '❌ Не удалось загрузить изображение ни на один сервер. Попробуйте другое фото.');
+            }
+
+            // 5. Сохраняем в БД
             await pool.query(
                 'INSERT INTO products (name, description, price, stock, image_url) VALUES ($1, $2, $3, $4, $5)',
                 [state.data.name, state.data.description, state.data.price, state.data.stock, permLink]
             );
 
-            delete adminStates[chatId];
-            bot.sendMessage(chatId, `✅ Товар добавлен!\nСток: ${state.data.stock} шт.\nСсылка: ${permLink}`, adminKeyboard);
+            delete adminStates[chatId]; // Сброс состояния
+            
+            bot.sendMessage(chatId, 
+                `✅ Товар успешно добавлен!\n\n📌 Название: ${state.data.name}\n💰 Цена: ${state.data.price}₽\n📦 Сток: ${state.data.stock}\n🖼 Ссылка: ${permLink}`, 
+                adminKeyboard
+            );
+
         } catch (e) {
-            bot.sendMessage(chatId, 'Ошибка фото.');
+            console.error('General Photo Error:', e);
+            bot.sendMessage(chatId, '❌ Критическая ошибка при обработке. Проверьте логи Railway.');
         }
     }
 });
@@ -419,3 +474,4 @@ app.post('/api/order', async (req, res) => {
 app.listen(PORT, () => {
     console.log(`Server v3 running on port ${PORT}`);
 });
+
