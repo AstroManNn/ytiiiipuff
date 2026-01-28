@@ -110,7 +110,6 @@ app.post('/api/admin/product', upload.single('photo'), async (req, res) => {
         if (!req.file) return res.status(400).json({ error: 'No photo uploaded' });
 
         // Отправляем фото боту (в чат админа), чтобы получить file_id
-        // Мы используем первого админа из списка как "хранилище"
         const storageChatId = getAdmins()[0]; 
         
         const photoMsg = await bot.sendPhoto(storageChatId, req.file.buffer, { caption: `New product: ${name}` });
@@ -138,6 +137,20 @@ app.delete('/api/admin/product/:id', async (req, res) => {
         await pool.query('DELETE FROM products WHERE id = $1', [req.params.id]);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: 'Delete error' }); }
+});
+
+// 2.1 Изменить сток товара (добавить или убавить)
+app.post('/api/admin/product/stock', async (req, res) => {
+    try {
+        const { userId, productId, change } = req.body; // change может быть +5 или -2
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
+
+        await pool.query(
+            'UPDATE products SET stock = stock + $1 WHERE id = $2', 
+            [parseInt(change), productId]
+        );
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: 'Stock update error' }); }
 });
 
 // 3. Получить заказы (активные или архив)
@@ -188,21 +201,25 @@ app.post('/api/admin/order/:id/done', async (req, res) => {
     } catch (err) { res.status(500).json({ error: 'Done error' }); }
 });
 
-// 5. Редактировать заказ
+// 5. Редактировать заказ (РАСШИРЕННАЯ ВЕРСИЯ)
 app.put('/api/admin/order/:id', async (req, res) => {
     try {
-        const { userId, address, comment } = req.body;
+        const { userId, address, comment, details, total_price } = req.body;
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
 
+        // Обновляем всё: адрес, коммент, json товаров и итоговую цену
         await pool.query(
-            "UPDATE orders SET address = $1, comment = $2 WHERE id = $3",
-            [address, comment, req.params.id]
+            "UPDATE orders SET address = $1, comment = $2, details = $3, total_price = $4 WHERE id = $5",
+            [address, comment, JSON.stringify(details), total_price, req.params.id]
         );
         res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: 'Update error' }); }
+    } catch (err) { 
+        console.error(err);
+        res.status(500).json({ error: 'Update error' }); 
+    }
 });
 
-// 6. Статистика (существующий код)
+// 6. Статистика
 app.get('/api/admin/stats', async (req, res) => {
     try {
         const userId = req.query.userId;
@@ -267,7 +284,7 @@ app.post('/api/admin/expense', async (req, res) => {
 
 // --- STANDARD API ---
 
-app.get('/', (req, res) => res.send('TripPuff v6 Full Admin Panel Running'));
+app.get('/', (req, res) => res.send('TripPuff v7 Full Admin Panel Running'));
 
 app.get('/api/image/:fileId', async (req, res) => {
     try {
@@ -388,4 +405,3 @@ app.post('/api/order', async (req, res) => {
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
-
