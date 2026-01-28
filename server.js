@@ -99,81 +99,102 @@ bot.onText(/\/start/, (msg) => {
 });
 
 
-// --- НОВЫЕ API ДЛЯ АДМИНКИ ---
+// --- АДМИНКА ---
 
-// 1. Добавить товар (с фото)
+// 1. Добавить товар (Одиночный)
 app.post('/api/admin/product', upload.single('photo'), async (req, res) => {
     try {
         const { userId, name, category, description, price, purchase_price, stock } = req.body;
-        
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
-        if (!req.file) return res.status(400).json({ error: 'No photo uploaded' });
 
-        // Отправляем фото боту (в чат админа), чтобы получить file_id
-        const storageChatId = getAdmins()[0]; 
-        
-        const photoMsg = await bot.sendPhoto(storageChatId, req.file.buffer, { caption: `New product: ${name}` });
-        const fileId = photoMsg.photo[photoMsg.photo.length - 1].file_id;
-        const internalLink = `${SERVER_URL}/api/image/${fileId}`;
+        let internalLink = null;
+        if (req.file) {
+            const storageChatId = getAdmins()[0]; 
+            const photoMsg = await bot.sendPhoto(storageChatId, req.file.buffer, { caption: `New product: ${name}` });
+            const fileId = photoMsg.photo[photoMsg.photo.length - 1].file_id;
+            internalLink = `${SERVER_URL}/api/image/${fileId}`;
+        } else {
+            internalLink = 'https://via.placeholder.com/300x300.png?text=No+Photo'; 
+        }
 
         await pool.query(
             'INSERT INTO products (name, category, description, price, purchase_price, stock, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-            [name, category, description, price, purchase_price, stock, internalLink]
+            [name, category, description, price, purchase_price || 0, stock || 0, internalLink]
         );
-
         res.json({ success: true });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Error adding product' });
-    }
+    } catch (err) { console.error(err); res.status(500).json({ error: 'Error adding product' }); }
+});
+
+// 1.1 Массовый импорт (Batch)
+app.post('/api/admin/products/batch', async (req, res) => {
+    try {
+        const { userId, products } = req.body;
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
+        
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN'); 
+            const defaultImage = 'https://via.placeholder.com/300x300.png?text=No+Photo'; 
+            for (const p of products) {
+                await client.query(
+                    'INSERT INTO products (name, category, description, price, purchase_price, stock, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+                    [p.name, p.category, p.description || '', p.price, p.purchase_price || 0, p.stock || 0, defaultImage]
+                );
+            }
+            await client.query('COMMIT'); 
+            res.json({ success: true, count: products.length });
+        } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+    } catch (err) { console.error(err); res.status(500).json({ error: 'Batch import error' }); }
+});
+
+// 1.2 БЫСТРОЕ ОБНОВЛЕНИЕ ФОТО (НОВОЕ)
+app.post('/api/admin/product/:id/image', upload.single('photo'), async (req, res) => {
+    try {
+        const userId = req.body.userId; // Multer parses body too
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
+        if (!req.file) return res.status(400).json({ error: 'No photo' });
+
+        const storageChatId = getAdmins()[0]; 
+        const photoMsg = await bot.sendPhoto(storageChatId, req.file.buffer, { caption: `Updated photo for ID: ${req.params.id}` });
+        const fileId = photoMsg.photo[photoMsg.photo.length - 1].file_id;
+        const internalLink = `${SERVER_URL}/api/image/${fileId}`;
+
+        await pool.query('UPDATE products SET image_url = $1 WHERE id = $2', [internalLink, req.params.id]);
+        
+        res.json({ success: true, imageUrl: internalLink });
+    } catch (err) { console.error(err); res.status(500).json({ error: 'Image upload error' }); }
 });
 
 // 2. Удалить товар
 app.delete('/api/admin/product/:id', async (req, res) => {
     try {
-        const userId = req.headers['user-id']; // Передаем ID админа в заголовке
+        const userId = req.headers['user-id'];
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
-
         await pool.query('DELETE FROM products WHERE id = $1', [req.params.id]);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: 'Delete error' }); }
 });
 
-// 2.1 Изменить сток товара (добавить или убавить)
+// 2.1 Изменить сток
 app.post('/api/admin/product/stock', async (req, res) => {
     try {
-        const { userId, productId, change } = req.body; // change может быть +5 или -2
+        const { userId, productId, change } = req.body;
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
-
-        await pool.query(
-            'UPDATE products SET stock = stock + $1 WHERE id = $2', 
-            [parseInt(change), productId]
-        );
+        await pool.query('UPDATE products SET stock = stock + $1 WHERE id = $2', [parseInt(change), productId]);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: 'Stock update error' }); }
 });
 
-// 3. Получить заказы (активные или архив)
+// 3. Получить заказы
 app.get('/api/admin/orders', async (req, res) => {
     try {
         const { userId, status } = req.query;
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
-
-        const result = await pool.query(
-            "SELECT * FROM orders WHERE status = $1 ORDER BY id DESC LIMIT 50", 
-            [status || 'active']
-        );
-        
-        // Получаем имена пользователей для каждого заказа
+        const result = await pool.query("SELECT * FROM orders WHERE status = $1 ORDER BY id DESC LIMIT 50", [status || 'active']);
         const orders = await Promise.all(result.rows.map(async (o) => {
             const u = await pool.query("SELECT name, phone, username FROM users WHERE telegram_id = $1", [o.user_telegram_id]);
-            return { 
-                ...o, 
-                user_data: u.rows[0],
-                items: JSON.parse(o.details)
-            };
+            return { ...o, user_data: u.rows[0], items: JSON.parse(o.details) };
         }));
-
         res.json(orders);
     } catch (err) { res.status(500).json({ error: 'Orders error' }); }
 });
@@ -183,40 +204,28 @@ app.post('/api/admin/order/:id/done', async (req, res) => {
     try {
         const { userId } = req.body;
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
-        const orderId = req.params.id;
-
-        const orderRes = await pool.query("SELECT * FROM orders WHERE id = $1 AND status = 'active'", [orderId]);
+        const orderRes = await pool.query("SELECT * FROM orders WHERE id = $1 AND status = 'active'", [req.params.id]);
         if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
-
-        const order = orderRes.rows[0];
-        const items = JSON.parse(order.details);
-
-        // Списываем сток
+        const items = JSON.parse(orderRes.rows[0].details);
         for (const item of items) {
             await pool.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [item.quantity, item.product_id]);
         }
-
-        await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [orderId]);
+        await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [req.params.id]);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: 'Done error' }); }
 });
 
-// 5. Редактировать заказ (РАСШИРЕННАЯ ВЕРСИЯ)
+// 5. Редактировать заказ
 app.put('/api/admin/order/:id', async (req, res) => {
     try {
         const { userId, address, comment, details, total_price } = req.body;
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
-
-        // Обновляем всё: адрес, коммент, json товаров и итоговую цену
         await pool.query(
             "UPDATE orders SET address = $1, comment = $2, details = $3, total_price = $4 WHERE id = $5",
             [address, comment, JSON.stringify(details), total_price, req.params.id]
         );
         res.json({ success: true });
-    } catch (err) { 
-        console.error(err);
-        res.status(500).json({ error: 'Update error' }); 
-    }
+    } catch (err) { res.status(500).json({ error: 'Update error' }); }
 });
 
 // 6. Статистика
@@ -224,52 +233,24 @@ app.get('/api/admin/stats', async (req, res) => {
     try {
         const userId = req.query.userId;
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
-
         const now = new Date();
         const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
         const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
-
-        const ordersRes = await pool.query(
-            "SELECT details, total_price FROM orders WHERE status = 'completed' AND created_at >= $1 AND created_at <= $2",
-            [startOfMonth, endOfMonth]
-        );
-
-        let totalRevenue = 0; 
-        let totalCOGS = 0;
-
+        
+        const ordersRes = await pool.query("SELECT details, total_price FROM orders WHERE status = 'completed' AND created_at >= $1 AND created_at <= $2", [startOfMonth, endOfMonth]);
+        let totalRevenue = 0, totalCOGS = 0;
         for (const order of ordersRes.rows) {
             totalRevenue += parseFloat(order.total_price);
             const items = JSON.parse(order.details);
             for (const item of items) {
                 const productRes = await pool.query("SELECT purchase_price FROM products WHERE id = $1", [item.product_id]);
-                if (productRes.rows.length > 0) {
-                    const purchasePrice = parseFloat(productRes.rows[0].purchase_price || 0);
-                    totalCOGS += purchasePrice * item.quantity;
-                }
+                if (productRes.rows.length > 0) totalCOGS += parseFloat(productRes.rows[0].purchase_price || 0) * item.quantity;
             }
         }
-
-        const expensesRes = await pool.query(
-            "SELECT * FROM expenses WHERE created_at >= $1 AND created_at <= $2 ORDER BY created_at DESC",
-            [startOfMonth, endOfMonth]
-        );
-
+        const expensesRes = await pool.query("SELECT * FROM expenses WHERE created_at >= $1 AND created_at <= $2 ORDER BY created_at DESC", [startOfMonth, endOfMonth]);
         let totalExpenses = 0;
-        const expensesList = expensesRes.rows.map(e => {
-            totalExpenses += parseFloat(e.amount);
-            return e;
-        });
-
-        const netProfit = totalRevenue - totalCOGS - totalExpenses;
-
-        res.json({
-            revenue: totalRevenue,
-            cogs: totalCOGS,
-            expenses: totalExpenses,
-            netProfit: netProfit,
-            expensesList: expensesList
-        });
-
+        const expensesList = expensesRes.rows.map(e => { totalExpenses += parseFloat(e.amount); return e; });
+        res.json({ revenue: totalRevenue, cogs: totalCOGS, expenses: totalExpenses, netProfit: totalRevenue - totalCOGS - totalExpenses, expensesList });
     } catch (err) { res.status(500).json({ error: 'Stats error' }); }
 });
 
@@ -282,78 +263,58 @@ app.post('/api/admin/expense', async (req, res) => {
     } catch (err) { res.status(500).json({ success: false }); }
 });
 
-// 7. VISUAL DB MANAGER (GENERIC CRUD)
-
-// Helper to check table safety
+// 7. VISUAL DB MANAGER
 const isValidTable = (t) => ['users', 'products', 'expenses', 'faq'].includes(t);
 
-// READ
 app.get('/api/admin/db/:table', async (req, res) => {
     try {
         if (!isAdmin(req.query.userId)) return res.status(403).json({ error: 'Denied' });
         if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
-        
         const result = await pool.query(`SELECT * FROM ${req.params.table} ORDER BY id DESC LIMIT 100`);
         res.json(result.rows);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// CREATE (Generic Insert)
 app.post('/api/admin/db/:table', async (req, res) => {
     try {
         const userId = req.headers['user-id'];
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Denied' });
         if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
-
         const data = req.body;
         const keys = Object.keys(data);
         const values = Object.values(data);
-        
         const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
-        const query = `INSERT INTO ${req.params.table} (${keys.join(', ')}) VALUES (${placeholders})`;
-        
-        await pool.query(query, values);
+        await pool.query(`INSERT INTO ${req.params.table} (${keys.join(', ')}) VALUES (${placeholders})`, values);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// UPDATE (Generic Update)
 app.put('/api/admin/db/:table/:id', async (req, res) => {
     try {
         const userId = req.headers['user-id'];
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Denied' });
         if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
-
         const data = req.body;
         const keys = Object.keys(data);
         const values = Object.values(data);
-        
-        // Build "col1 = $1, col2 = $2"
         const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(', ');
-        const query = `UPDATE ${req.params.table} SET ${setClause} WHERE id = $${values.length + 1}`;
-        
-        await pool.query(query, [...values, req.params.id]);
+        await pool.query(`UPDATE ${req.params.table} SET ${setClause} WHERE id = $${values.length + 1}`, [...values, req.params.id]);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// DELETE (Generic Delete)
 app.delete('/api/admin/db/:table/:id', async (req, res) => {
     try {
         const userId = req.headers['user-id'];
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Denied' });
         if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
-
         await pool.query(`DELETE FROM ${req.params.table} WHERE id = $1`, [req.params.id]);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-
 // --- STANDARD API ---
-
-app.get('/', (req, res) => res.send('TripPuff v9 Visual DB Admin Running'));
-
+app.get('/', (req, res) => res.send('TripPuff v11 Photo Wizard Running'));
 app.get('/api/image/:fileId', async (req, res) => {
     try {
         const fileLink = await bot.getFileLink(req.params.fileId);
@@ -362,83 +323,54 @@ app.get('/api/image/:fileId', async (req, res) => {
         response.data.pipe(res);
     } catch (e) { res.status(404).send('Not found'); }
 });
-
 app.get('/api/user/:id', async (req, res) => {
     try {
-        const userId = req.params.id;
-        const result = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [userId]);
-        if (result.rows.length > 0) {
-            const user = result.rows[0];
-            user.is_admin = isAdmin(userId);
-            res.json(user);
-        } else res.status(404).json({ message: 'User not found' });
+        const result = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [req.params.id]);
+        if (result.rows.length > 0) { const user = result.rows[0]; user.is_admin = isAdmin(req.params.id); res.json(user); } 
+        else res.status(404).json({ message: 'User not found' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
-
 app.post('/api/register', async (req, res) => {
     try {
         const { userId, name, phone, username } = req.body;
         const referralCode = 'REF-' + Math.random().toString(36).substring(2, 8).toUpperCase();
-        const result = await pool.query(
-            'INSERT INTO users (telegram_id, name, phone, username, referral_code) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-            [userId, name, phone, username, referralCode]
-        );
+        const result = await pool.query('INSERT INTO users (telegram_id, name, phone, username, referral_code) VALUES ($1, $2, $3, $4, $5) RETURNING *', [userId, name, phone, username, referralCode]);
         res.json({ success: true, user: result.rows[0] });
     } catch (err) { res.status(500).json({ success: false }); }
 });
-
 app.get('/api/products', async (req, res) => {
-    try {
-        const result = await pool.query('SELECT * FROM products ORDER BY id DESC');
-        res.json(result.rows);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    try { const result = await pool.query('SELECT * FROM products ORDER BY id DESC'); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
-
 app.get('/api/faq', async (req, res) => {
-    try {
-        const result = await pool.query('SELECT * FROM faq ORDER BY id ASC');
-        res.json(result.rows);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    try { const result = await pool.query('SELECT * FROM faq ORDER BY id ASC'); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
-
 app.get('/api/cart/:userId', async (req, res) => {
     try {
-        const result = await pool.query(`
-            SELECT c.product_id, c.quantity, p.name, p.price, p.image_url 
-            FROM cart_items c JOIN products p ON c.product_id = p.id
-            WHERE c.user_telegram_id = $1 ORDER BY p.name ASC
-        `, [req.params.userId]);
+        const result = await pool.query(`SELECT c.product_id, c.quantity, p.name, p.price, p.image_url FROM cart_items c JOIN products p ON c.product_id = p.id WHERE c.user_telegram_id = $1 ORDER BY p.name ASC`, [req.params.userId]);
         res.json(result.rows);
     } catch (err) { res.status(500).json({ error: 'Cart error' }); }
 });
-
 app.post('/api/cart/add', async (req, res) => {
     try {
         const { userId, productId } = req.body;
         const check = await pool.query('SELECT * FROM cart_items WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
-        if (check.rows.length > 0) {
-            await pool.query('UPDATE cart_items SET quantity = quantity + 1 WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
-        } else {
-            await pool.query('INSERT INTO cart_items (user_telegram_id, product_id, quantity) VALUES ($1, $2, 1)', [userId, productId]);
-        }
+        if (check.rows.length > 0) await pool.query('UPDATE cart_items SET quantity = quantity + 1 WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
+        else await pool.query('INSERT INTO cart_items (user_telegram_id, product_id, quantity) VALUES ($1, $2, 1)', [userId, productId]);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: 'Add cart error' }); }
 });
-
 app.post('/api/cart/remove', async (req, res) => {
     try {
         const { userId, productId, removeAll } = req.body;
         if (removeAll) await pool.query('DELETE FROM cart_items WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
         else {
             const check = await pool.query('SELECT quantity FROM cart_items WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
-            if (check.rows.length > 0 && check.rows[0].quantity > 1) {
-                await pool.query('UPDATE cart_items SET quantity = quantity - 1 WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
-            } else await pool.query('DELETE FROM cart_items WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
+            if (check.rows.length > 0 && check.rows[0].quantity > 1) await pool.query('UPDATE cart_items SET quantity = quantity - 1 WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
+            else await pool.query('DELETE FROM cart_items WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
         }
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: 'Remove cart error' }); }
 });
-
 app.post('/api/order', async (req, res) => {
     try {
         const { userId, address, comment } = req.body;
@@ -448,28 +380,15 @@ app.post('/api/order', async (req, res) => {
         const cartRes = await pool.query(`SELECT c.quantity, c.product_id, p.name, p.price FROM cart_items c JOIN products p ON c.product_id = p.id WHERE c.user_telegram_id = $1`, [userId]);
         if (cartRes.rows.length === 0) return res.status(400).json({ success: false });
         const items = cartRes.rows;
-        let totalPrice = 0;
-        let itemsListText = '';
-        items.forEach(item => {
-            const sum = item.price * item.quantity;
-            totalPrice += sum;
-            itemsListText += `- ${item.name} x${item.quantity} = ${sum}₽\n`;
-        });
+        let totalPrice = 0, itemsListText = '';
+        items.forEach(item => { const sum = item.price * item.quantity; totalPrice += sum; itemsListText += `- ${item.name} x${item.quantity} = ${sum}₽\n`; });
         const userLink = user.username ? `@${user.username}` : `[${user.name}](tg://user?id=${user.telegram_id})`;
         const orderText = `📦 *НОВЫЙ ЗАКАЗ*\n\n👤 *Клиент:* ${user.name}\n🔗 *Ссылка:* ${userLink}\n📞 *Телефон:* ${user.phone}\n\n📍 *Адрес:* \`${address}\`\n💬 *Комментарий:* ${comment || 'Нет'}\n\n🛒 *Товары:*\n${itemsListText}\n💰 *ИТОГО: ${totalPrice}₽*`;
-        const newOrder = await pool.query(
-            'INSERT INTO orders (user_telegram_id, details, total_price, address, comment, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
-            [userId, JSON.stringify(items), totalPrice, address, comment, 'active']
-        );
-        const orderId = newOrder.rows[0].id;
+        const newOrder = await pool.query('INSERT INTO orders (user_telegram_id, details, total_price, address, comment, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id', [userId, JSON.stringify(items), totalPrice, address, comment, 'active']);
         await pool.query('DELETE FROM cart_items WHERE user_telegram_id = $1', [userId]);
-        getAdmins().forEach(adminId => {
-            if (adminId) bot.sendMessage(adminId, orderText + `\n🆔 *ID:* ${orderId}\n\n🤖 Зайдите в админ-панель для управления.`, { parse_mode: 'Markdown' }).catch(e => console.error(e));
-        });
+        getAdmins().forEach(adminId => { if (adminId) bot.sendMessage(adminId, orderText + `\n🆔 *ID:* ${newOrder.rows[0].id}\n\n🤖 Зайдите в админ-панель для управления.`, { parse_mode: 'Markdown' }).catch(e => console.error(e)); });
         res.json({ success: true });
     } catch (err) { res.status(500).json({ success: false }); }
 });
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => { console.log(`Server running on port ${PORT}`); });
