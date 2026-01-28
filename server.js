@@ -282,9 +282,77 @@ app.post('/api/admin/expense', async (req, res) => {
     } catch (err) { res.status(500).json({ success: false }); }
 });
 
+// 7. VISUAL DB MANAGER (GENERIC CRUD)
+
+// Helper to check table safety
+const isValidTable = (t) => ['users', 'products', 'expenses', 'faq'].includes(t);
+
+// READ
+app.get('/api/admin/db/:table', async (req, res) => {
+    try {
+        if (!isAdmin(req.query.userId)) return res.status(403).json({ error: 'Denied' });
+        if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
+        
+        const result = await pool.query(`SELECT * FROM ${req.params.table} ORDER BY id DESC LIMIT 100`);
+        res.json(result.rows);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// CREATE (Generic Insert)
+app.post('/api/admin/db/:table', async (req, res) => {
+    try {
+        const userId = req.headers['user-id'];
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Denied' });
+        if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
+
+        const data = req.body;
+        const keys = Object.keys(data);
+        const values = Object.values(data);
+        
+        const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
+        const query = `INSERT INTO ${req.params.table} (${keys.join(', ')}) VALUES (${placeholders})`;
+        
+        await pool.query(query, values);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// UPDATE (Generic Update)
+app.put('/api/admin/db/:table/:id', async (req, res) => {
+    try {
+        const userId = req.headers['user-id'];
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Denied' });
+        if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
+
+        const data = req.body;
+        const keys = Object.keys(data);
+        const values = Object.values(data);
+        
+        // Build "col1 = $1, col2 = $2"
+        const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(', ');
+        const query = `UPDATE ${req.params.table} SET ${setClause} WHERE id = $${values.length + 1}`;
+        
+        await pool.query(query, [...values, req.params.id]);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE (Generic Delete)
+app.delete('/api/admin/db/:table/:id', async (req, res) => {
+    try {
+        const userId = req.headers['user-id'];
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Denied' });
+        if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
+
+        await pool.query(`DELETE FROM ${req.params.table} WHERE id = $1`, [req.params.id]);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
 // --- STANDARD API ---
 
-app.get('/', (req, res) => res.send('TripPuff v7 Full Admin Panel Running'));
+app.get('/', (req, res) => res.send('TripPuff v9 Visual DB Admin Running'));
 
 app.get('/api/image/:fileId', async (req, res) => {
     try {
