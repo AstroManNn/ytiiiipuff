@@ -22,14 +22,10 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-// Инициализация бота (Polling)
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
-
-// Хранилище состояний для админов (кто на каком этапе добавления товара)
 const adminStates = {}; 
-// Этапы: 'WAITING_NAME', 'WAITING_PRICE', 'WAITING_DESC', 'WAITING_PHOTO'
 
-// --- ФУНКЦИИ БАЗЫ ДАННЫХ ---
+// --- ИНИЦИАЛИЗАЦИЯ БД ---
 const initDB = async () => {
     try {
         await pool.query(`
@@ -49,6 +45,7 @@ const initDB = async () => {
                 description TEXT,
                 price DECIMAL(10, 2) NOT NULL,
                 image_url TEXT,
+                stock INTEGER DEFAULT 0,  -- Добавлено поле количества
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS faq (
@@ -70,35 +67,39 @@ const initDB = async () => {
                 total_price DECIMAL(10, 2),
                 address TEXT,
                 comment TEXT,
+                status VARCHAR(20) DEFAULT 'active', -- 'active' или 'completed'
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        // Миграция для старых таблиц (на всякий случай)
+
+        // Миграции для старых баз данных (добавляем колонки, если их нет)
         await pool.query(`
             DO $$ BEGIN 
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='username') THEN 
-                    ALTER TABLE users ADD COLUMN username VARCHAR(255); 
-                END IF; 
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='products' AND column_name='stock') THEN 
+                    ALTER TABLE products ADD COLUMN stock INTEGER DEFAULT 0; 
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='status') THEN 
+                    ALTER TABLE orders ADD COLUMN status VARCHAR(20) DEFAULT 'active'; 
+                END IF;
             END $$;
         `);
-        console.log('✅ БД готова.');
+        console.log('✅ БД готова (v3 Stock & Orders).');
     } catch (err) { console.error('❌ Ошибка БД:', err); }
 };
 initDB();
 
 // --- ЛОГИКА БОТА ---
 
-// Проверка на админа
 const isAdmin = (chatId) => {
     const admins = process.env.ADMIN_CHAT_ID.split(',').map(id => id.trim());
     return admins.includes(chatId.toString());
 };
 
-// Клавиатура админа
 const adminKeyboard = {
     reply_markup: {
         keyboard: [
-            ['➕ Добавить т/в', '❌ Удалить т/в']
+            ['➕ Добавить т/в', '❌ Удалить т/в'],
+            ['📦 Заказы']
         ],
         resize_keyboard: true
     }
@@ -106,126 +107,184 @@ const adminKeyboard = {
 
 bot.onText(/\/start/, (msg) => {
     if (isAdmin(msg.chat.id)) {
-        bot.sendMessage(msg.chat.id, 'Добро пожаловать, Админ! Выберите действие:', adminKeyboard);
+        bot.sendMessage(msg.chat.id, 'Админ-панель V3.0', adminKeyboard);
     } else {
-        bot.sendMessage(msg.chat.id, 'Привет! Открой Mini App для покупок.');
+        bot.sendMessage(msg.chat.id, 'Привет! Открой Mini App.');
     }
 });
 
-// Обработка текстовых сообщений
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     if (!isAdmin(chatId)) return;
-
     const text = msg.text;
     const state = adminStates[chatId];
 
-    // 1. Команда: Добавить т/в
+    // --- ГЛАВНОЕ МЕНЮ ---
+    
+    // 1. Добавить товар
     if (text === '➕ Добавить т/в') {
         adminStates[chatId] = { step: 'WAITING_NAME', data: {} };
         return bot.sendMessage(chatId, 'Введите название товара:');
     }
 
-    // 2. Команда: Удалить т/в
+    // 2. Удалить товар
     if (text === '❌ Удалить т/в') {
         try {
-            const res = await pool.query('SELECT id, name FROM products ORDER BY id ASC');
-            if (res.rows.length === 0) return bot.sendMessage(chatId, 'Список товаров пуст.');
+            const res = await pool.query('SELECT id, name, stock FROM products ORDER BY id ASC');
+            if (res.rows.length === 0) return bot.sendMessage(chatId, 'Список пуст.');
             
-            let list = '📦 *Список товаров:*\n\n';
-            res.rows.forEach(p => {
-                list += `${p.id}. ${p.name}\n`;
-            });
-            list += '\n📝 Чтобы удалить, напишите: `/del ID` (например: `/del 5`)';
+            let list = '🗑 *Удаление товаров:*\n\n';
+            res.rows.forEach(p => list += `${p.id}. ${p.name} (В наличии: ${p.stock})\n`);
+            list += '\nНапишите `/del ID` для удаления.';
             return bot.sendMessage(chatId, list, { parse_mode: 'Markdown' });
-        } catch (e) { return bot.sendMessage(chatId, 'Ошибка получения списка.'); }
+        } catch (e) { return bot.sendMessage(chatId, 'Ошибка БД'); }
     }
 
-    // 3. Команда удаления (/del N)
+    // 3. Список заказов (Активные)
+    if (text === '📦 Заказы') {
+        return showOrders(chatId, 'active');
+    }
+
+    // --- КОМАНДЫ ---
+
+    // Удаление товара
     if (text && text.startsWith('/del ')) {
-        const idToDelete = text.split(' ')[1];
-        if (!idToDelete) return bot.sendMessage(chatId, 'Укажите ID.');
-        try {
-            await pool.query('DELETE FROM products WHERE id = $1', [idToDelete]);
-            return bot.sendMessage(chatId, `✅ Товар с ID ${idToDelete} удален.`);
-        } catch (e) { return bot.sendMessage(chatId, 'Ошибка удаления (возможно, неверный ID).'); }
+        const id = text.split(' ')[1];
+        await pool.query('DELETE FROM products WHERE id = $1', [id]);
+        return bot.sendMessage(chatId, `✅ Товар ${id} удален.`);
     }
 
-    // --- МАШИНА СОСТОЯНИЙ (Добавление товара) ---
+    // Завершение заказа (/done)
+    if (text && text.startsWith('/done ')) {
+        const id = text.split(' ')[1];
+        if (!id) return;
+
+        try {
+            // 1. Получаем заказ
+            const orderRes = await pool.query("SELECT * FROM orders WHERE id = $1 AND status = 'active'", [id]);
+            if (orderRes.rows.length === 0) return bot.sendMessage(chatId, '❌ Заказ не найден или уже завершен.');
+            
+            const order = orderRes.rows[0];
+            const items = JSON.parse(order.details); // [{ product_id, quantity, ... }]
+
+            // 2. Списываем товары со склада
+            for (const item of items) {
+                // Если product_id не найден (товар удалили), игнорируем
+                // SQL: Уменьшаем stock на quantity
+                await pool.query(
+                    'UPDATE products SET stock = stock - $1 WHERE id = $2',
+                    [item.quantity, item.product_id]
+                );
+            }
+
+            // 3. Меняем статус заказа
+            await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [id]);
+
+            bot.sendMessage(chatId, `✅ Заказ #${id} перенесен в архив. Остатки товаров списаны.`);
+            // Показываем обновленный список
+            return showOrders(chatId, 'active');
+
+        } catch (e) {
+            console.error(e);
+            return bot.sendMessage(chatId, 'Ошибка при завершении заказа.');
+        }
+    }
+
+    // Архив (/archive)
+    if (text === '/archive') {
+        return showOrders(chatId, 'completed');
+    }
+
+    // --- МАШИНА СОСТОЯНИЙ (Добавление) ---
     if (state) {
         if (state.step === 'WAITING_NAME') {
             state.data.name = text;
             state.step = 'WAITING_PRICE';
-            return bot.sendMessage(chatId, 'Введите цену (только цифры):');
+            return bot.sendMessage(chatId, 'Введите цену (число):');
         }
-
         if (state.step === 'WAITING_PRICE') {
-            const price = parseFloat(text);
-            if (isNaN(price)) return bot.sendMessage(chatId, 'Пожалуйста, введите число.');
-            state.data.price = price;
-            state.step = 'WAITING_DESC';
-            return bot.sendMessage(chatId, 'Введите описание товара:');
+            state.data.price = parseFloat(text);
+            state.step = 'WAITING_STOCK'; // НОВЫЙ ШАГ
+            return bot.sendMessage(chatId, 'Введите количество товара в наличии (число):');
         }
-
+        if (state.step === 'WAITING_STOCK') { // НОВЫЙ ШАГ
+            state.data.stock = parseInt(text);
+            state.step = 'WAITING_DESC';
+            return bot.sendMessage(chatId, 'Введите описание:');
+        }
         if (state.step === 'WAITING_DESC') {
             state.data.description = text;
             state.step = 'WAITING_PHOTO';
-            return bot.sendMessage(chatId, 'Отправьте картинку товара (сжатую, не файлом):');
+            return bot.sendMessage(chatId, 'Отправьте фото:');
         }
     }
 });
 
-// Обработка фото (для добавления товара)
+// Функция показа заказов
+async function showOrders(chatId, status) {
+    try {
+        const res = await pool.query(
+            "SELECT * FROM orders WHERE status = $1 ORDER BY id DESC LIMIT 10", 
+            [status]
+        );
+        
+        const title = status === 'active' ? '🔥 ДЕЙСТВУЮЩИЕ ЗАКАЗЫ' : '🗄 АРХИВ ЗАКАЗОВ';
+        let msg = `*${title}*\n\n`;
+
+        if (res.rows.length === 0) {
+            msg += "Список пуст.";
+        } else {
+            res.rows.forEach(o => {
+                const date = new Date(o.created_at).toLocaleDateString('ru-RU');
+                msg += `🆔 *Заказ #${o.id}* (${date})\n`;
+                msg += `💰 Сумма: ${o.total_price}₽\n`;
+                msg += `📍 Адрес: ${o.address}\n`;
+                msg += `------------------\n`;
+            });
+        }
+
+        if (status === 'active') {
+            msg += "\n✅ Завершить заказ: `/done ID`\n🗄 Архив: `/archive`";
+        }
+
+        bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+    } catch (e) { console.error(e); }
+}
+
+// Загрузка фото
 bot.on('photo', async (msg) => {
     const chatId = msg.chat.id;
     const state = adminStates[chatId];
-
     if (state && state.step === 'WAITING_PHOTO') {
-        bot.sendMessage(chatId, '⏳ Загружаю фото...');
-        
+        bot.sendMessage(chatId, '⏳ Загрузка...');
         try {
-            // Берем самое качественное фото
-            const photo = msg.photo[msg.photo.length - 1];
-            const fileId = photo.file_id;
-            
-            // Получаем ссылку на скачивание от Телеграма
+            const fileId = msg.photo[msg.photo.length - 1].file_id;
             const fileLink = await bot.getFileLink(fileId);
-            
-            // Скачиваем фото
             const imageResponse = await axios({ url: fileLink, responseType: 'stream' });
             
-            // Загружаем на Telegraph (хитрость для вечной ссылки)
             const form = new FormData();
-            form.append('file', imageResponse.data, { filename: 'image.jpg' });
+            form.append('file', imageResponse.data, { filename: 'img.jpg' });
             
-            const uploadRes = await axios.post('https://telegra.ph/upload', form, {
-                headers: { ...form.getHeaders() }
-            });
-
+            const uploadRes = await axios.post('https://telegra.ph/upload', form, { headers: { ...form.getHeaders() } });
             const permLink = 'https://telegra.ph' + uploadRes.data[0].src;
 
-            // Сохраняем в БД
             await pool.query(
-                'INSERT INTO products (name, description, price, image_url) VALUES ($1, $2, $3, $4)',
-                [state.data.name, state.data.description, state.data.price, permLink]
+                'INSERT INTO products (name, description, price, stock, image_url) VALUES ($1, $2, $3, $4, $5)',
+                [state.data.name, state.data.description, state.data.price, state.data.stock, permLink]
             );
 
-            delete adminStates[chatId]; // Сброс состояния
-            bot.sendMessage(chatId, `✅ Товар "${state.data.name}" успешно добавлен!\nКартинка: ${permLink}`, adminKeyboard);
-
+            delete adminStates[chatId];
+            bot.sendMessage(chatId, `✅ Товар добавлен!\nСток: ${state.data.stock} шт.\nСсылка: ${permLink}`, adminKeyboard);
         } catch (e) {
-            console.error(e);
-            bot.sendMessage(chatId, '❌ Ошибка загрузки фото. Попробуйте снова.');
+            bot.sendMessage(chatId, 'Ошибка фото.');
         }
     }
 });
 
-
 // --- API ---
 
-app.get('/', (req, res) => res.send('TripPuff Server & Bot Active 🚀'));
+app.get('/', (req, res) => res.send('Server Running'));
 
-// Получить юзера
 app.get('/api/user/:id', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [req.params.id]);
@@ -234,7 +293,6 @@ app.get('/api/user/:id', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Регистрация
 app.post('/api/register', async (req, res) => {
     try {
         const { userId, name, phone, username } = req.body;
@@ -244,18 +302,16 @@ app.post('/api/register', async (req, res) => {
             [userId, name, phone, username, referralCode]
         );
         res.json({ success: true, user: result.rows[0] });
-    } catch (err) { res.status(500).json({ success: false, message: 'Ошибка регистрации' }); }
+    } catch (err) { res.status(500).json({ success: false }); }
 });
 
-// Товары
 app.get('/api/products', async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM products ORDER BY id ASC'); // Сортировка по ID, чтобы соответствовало списку удаления
+        const result = await pool.query('SELECT * FROM products ORDER BY id ASC');
         res.json(result.rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// FAQ
 app.get('/api/faq', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM faq ORDER BY id ASC');
@@ -267,14 +323,11 @@ app.get('/api/faq', async (req, res) => {
 app.get('/api/cart/:userId', async (req, res) => {
     try {
         const { userId } = req.params;
-        const query = `
+        const result = await pool.query(`
             SELECT c.product_id, c.quantity, p.name, p.price, p.image_url 
-            FROM cart_items c
-            JOIN products p ON c.product_id = p.id
-            WHERE c.user_telegram_id = $1
-            ORDER BY p.name ASC
-        `;
-        const result = await pool.query(query, [userId]);
+            FROM cart_items c JOIN products p ON c.product_id = p.id
+            WHERE c.user_telegram_id = $1 ORDER BY p.name ASC
+        `, [userId]);
         res.json(result.rows);
     } catch (err) { res.status(500).json({ error: 'Cart error' }); }
 });
@@ -311,22 +364,21 @@ app.post('/api/cart/remove', async (req, res) => {
     } catch (err) { res.status(500).json({ error: 'Remove cart error' }); }
 });
 
-// Заказ
+// Заказ (при создании статус active)
 app.post('/api/order', async (req, res) => {
     try {
         const { userId, address, comment } = req.body;
         const userRes = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [userId]);
-        if (userRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Пользователь не найден' });
-        
+        if (userRes.rows.length === 0) return res.status(404).json({ success: false, message: 'User not found' });
         const user = userRes.rows[0];
+
         const cartRes = await pool.query(`
-            SELECT c.quantity, p.name, p.price 
-            FROM cart_items c
-            JOIN products p ON c.product_id = p.id
+            SELECT c.quantity, c.product_id, p.name, p.price 
+            FROM cart_items c JOIN products p ON c.product_id = p.id
             WHERE c.user_telegram_id = $1
         `, [userId]);
 
-        if (cartRes.rows.length === 0) return res.status(400).json({ success: false, message: 'Корзина пуста' });
+        if (cartRes.rows.length === 0) return res.status(400).json({ success: false, message: 'Empty cart' });
 
         const items = cartRes.rows;
         let totalPrice = 0;
@@ -340,23 +392,30 @@ app.post('/api/order', async (req, res) => {
         const userLink = user.username ? `@${user.username}` : `[${user.name}](tg://user?id=${user.telegram_id})`;
         const orderText = `📦 *НОВЫЙ ЗАКАЗ*\n\n👤 *Клиент:* ${user.name}\n🔗 *Ссылка:* ${userLink}\n📞 *Телефон:* ${user.phone}\n\n📍 *Адрес:* \`${address}\`\n💬 *Комментарий:* ${comment || 'Нет'}\n\n🛒 *Товары:*\n${itemsListText}\n💰 *ИТОГО: ${totalPrice}₽*`;
 
-        await pool.query('INSERT INTO orders (user_telegram_id, details, total_price, address, comment) VALUES ($1, $2, $3, $4, $5)', [userId, JSON.stringify(items), totalPrice, address, comment]);
+        // Создаем заказ со статусом 'active'
+        const newOrder = await pool.query(
+            'INSERT INTO orders (user_telegram_id, details, total_price, address, comment, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+            [userId, JSON.stringify(items), totalPrice, address, comment, 'active']
+        );
+        const orderId = newOrder.rows[0].id;
+
         await pool.query('DELETE FROM cart_items WHERE user_telegram_id = $1', [userId]);
 
-        // Рассылка админам
+        // Уведомление с ID заказа
         const adminIds = process.env.ADMIN_CHAT_ID.split(',').map(id => id.trim());
+        const adminMsg = orderText + `\n🆔 *ID Заказа:* ${orderId}\n\n👉 Чтобы подтвердить и списать остатки, напишите:\n/done ${orderId}`;
+        
         for (const adminId of adminIds) {
-            if (adminId) {
-                bot.sendMessage(adminId, orderText, { parse_mode: 'Markdown' }).catch(e => console.error(e));
-            }
+            if (adminId) bot.sendMessage(adminId, adminMsg, { parse_mode: 'Markdown' }).catch(e => console.error(e));
         }
+
         res.json({ success: true });
     } catch (err) {
-        console.error('Order Error:', err);
-        res.status(500).json({ success: false, message: 'Ошибка оформления' });
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Error' });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Server & Bot running on port ${PORT}`);
+    console.log(`Server v3 running on port ${PORT}`);
 });
