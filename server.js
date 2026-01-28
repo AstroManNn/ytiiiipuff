@@ -9,6 +9,8 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const SERVER_URL = 'https://ytiiiipuff-production.up.railway.app'; 
+
 app.use(cors());
 app.use(express.json());
 
@@ -251,87 +253,35 @@ async function showOrders(chatId, status) {
     } catch (e) { console.error(e); }
 }
 
-// --- ОБРАБОТКА ФОТО (НАДЕЖНАЯ ЗАГРУЗКА) ---
+// --- ОБРАБОТКА ФОТО (Сохраняем File ID) ---
 bot.on('photo', async (msg) => {
     const chatId = msg.chat.id;
     const state = adminStates[chatId];
 
     if (state && state.step === 'WAITING_PHOTO') {
-        bot.sendMessage(chatId, '⏳ Обработка и загрузка фото... (это может занять пару секунд)');
-        
         try {
-            // 1. Получаем ссылку и скачиваем фото в буфер (память)
+            // Берем ID самого качественного фото
             const fileId = msg.photo[msg.photo.length - 1].file_id;
-            const fileLink = await bot.getFileLink(fileId);
             
-            // Скачиваем как ArrayBuffer
-            const response = await axios.get(fileLink, { responseType: 'arraybuffer' });
-            const buffer = Buffer.from(response.data);
+            // Формируем ссылку на НАШ сервер
+            const internalLink = `${SERVER_URL}/api/image/${fileId}`;
 
-            let permLink = null;
-
-            // 2. Попытка №1: Загрузка на Telegraph
-            try {
-                const form = new FormData();
-                form.append('file', buffer, { filename: 'image.jpg', contentType: 'image/jpeg' });
-
-                const uploadRes = await axios.post('https://telegra.ph/upload', form, {
-                    headers: {
-                        ...form.getHeaders(),
-                        // Притворяемся браузером, чтобы не заблокировали
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                    }
-                });
-
-                if (uploadRes.data && uploadRes.data[0] && uploadRes.data[0].src) {
-                    permLink = 'https://telegra.ph' + uploadRes.data[0].src;
-                    console.log('✅ Загружено на Telegraph:', permLink);
-                }
-            } catch (telegraphError) {
-                console.error('⚠️ Telegraph error (пробую резерв):', telegraphError.message);
-            }
-
-            // 3. Попытка №2: Загрузка на Catbox (если Telegraph не сработал)
-            if (!permLink) {
-                try {
-                    const formCat = new FormData();
-                    formCat.append('reqtype', 'fileupload');
-                    formCat.append('fileToUpload', buffer, { filename: 'image.jpg', contentType: 'image/jpeg' });
-
-                    const catRes = await axios.post('https://catbox.moe/user/api.php', formCat, {
-                        headers: { ...formCat.getHeaders() }
-                    });
-                    
-                    if (catRes.data && catRes.data.startsWith('http')) {
-                        permLink = catRes.data;
-                        console.log('✅ Загружено на Catbox:', permLink);
-                    }
-                } catch (catError) {
-                    console.error('❌ Catbox error:', catError.message);
-                }
-            }
-
-            // 4. Если ничего не вышло
-            if (!permLink) {
-                return bot.sendMessage(chatId, '❌ Не удалось загрузить изображение ни на один сервер. Попробуйте другое фото.');
-            }
-
-            // 5. Сохраняем в БД
+            // Сохраняем в БД
             await pool.query(
                 'INSERT INTO products (name, description, price, stock, image_url) VALUES ($1, $2, $3, $4, $5)',
-                [state.data.name, state.data.description, state.data.price, state.data.stock, permLink]
+                [state.data.name, state.data.description, state.data.price, state.data.stock, internalLink]
             );
 
             delete adminStates[chatId]; // Сброс состояния
             
             bot.sendMessage(chatId, 
-                `✅ Товар успешно добавлен!\n\n📌 Название: ${state.data.name}\n💰 Цена: ${state.data.price}₽\n📦 Сток: ${state.data.stock}\n🖼 Ссылка: ${permLink}`, 
+                `✅ Товар успешно добавлен!\n\n📌 Название: ${state.data.name}\n💰 Цена: ${state.data.price}₽\n📦 Сток: ${state.data.stock}\n🖼 Картинка прикреплена.`, 
                 adminKeyboard
             );
 
         } catch (e) {
-            console.error('General Photo Error:', e);
-            bot.sendMessage(chatId, '❌ Критическая ошибка при обработке. Проверьте логи Railway.');
+            console.error('Save Error:', e);
+            bot.sendMessage(chatId, '❌ Ошибка при сохранении в базу данных.');
         }
     }
 });
@@ -471,7 +421,32 @@ app.post('/api/order', async (req, res) => {
     }
 });
 
+// --- ПРОКСИ ДЛЯ КАРТИНОК (Самый надежный способ) ---
+app.get('/api/image/:fileId', async (req, res) => {
+    try {
+        const fileId = req.params.fileId;
+        // Получаем прямую ссылку от Telegram (она живет 1 час, поэтому запрашиваем каждый раз)
+        const fileLink = await bot.getFileLink(fileId);
+        
+        // Скачиваем и сразу отдаем браузеру (Stream)
+        const response = await axios({
+            url: fileLink,
+            method: 'GET',
+            responseType: 'stream'
+        });
+
+        // Настраиваем заголовки, чтобы браузер понял, что это картинка
+        res.setHeader('Content-Type', 'image/jpeg');
+        // Переливаем поток от Телеграма пользователю
+        response.data.pipe(res);
+    } catch (e) {
+        console.error('Error serving image:', e.message);
+        res.status(404).send('Image not found');
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Server v3 running on port ${PORT}`);
 });
+
 
