@@ -10,12 +10,13 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 👇 ВСТАВЬ СВОЮ ССЫЛКУ!
+// 👇 ВСТАВЬ СВОЮ ССЫЛКУ на Railway!
 const SERVER_URL = 'https://ytiiiipuff-production.up.railway.app'; 
 
 app.use(cors());
 app.use(express.json());
 
+// Настройка Multer (храним фото в памяти)
 const upload = multer({ storage: multer.memoryStorage() });
 
 if (!process.env.DATABASE_URL) console.error("❌ Нет DATABASE_URL");
@@ -29,7 +30,7 @@ const pool = new Pool({
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
-// --- БД ---
+// --- БД: Инициализация и Миграции ---
 const initDB = async () => {
     try {
         const client = await pool.connect();
@@ -84,7 +85,7 @@ const initDB = async () => {
                     status VARCHAR(20) DEFAULT 'active',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
-                -- НОВАЯ ТАБЛИЦА ПРОМОКОДОВ
+                -- Таблица ПРОМОКОДОВ
                 CREATE TABLE IF NOT EXISTS promocodes (
                     id SERIAL PRIMARY KEY,
                     code VARCHAR(50) UNIQUE NOT NULL,
@@ -94,10 +95,10 @@ const initDB = async () => {
                 );
             `);
 
-            // Миграции для старых БД (добавляем колонки, если их нет)
+            // Добавляем колонки в таблицу orders, если их нет (для старых БД)
             await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS points_used INTEGER DEFAULT 0;`);
             await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS promocode VARCHAR(50);`);
-            await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS initial_price DECIMAL(10, 2);`); // Цена до скидок
+            await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS initial_price DECIMAL(10, 2);`);
 
             console.log('✅ БД готова.');
         } finally {
@@ -114,7 +115,10 @@ bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id, 'Привет! Всё управление теперь внутри Mini App.');
 });
 
-// --- API ПРОМОКОДЫ ---
+
+// --- ЛОГИКА ПРОМОКОДОВ ---
+
+// Проверка промокода (клиент вызывает в корзине)
 app.get('/api/promocode/check/:code', async (req, res) => {
     try {
         const { code } = req.params;
@@ -127,6 +131,7 @@ app.get('/api/promocode/check/:code', async (req, res) => {
     } catch (e) { res.status(500).json({ success: false }); }
 });
 
+// Админ: Получить список
 app.get('/api/admin/promocodes', async (req, res) => {
     try {
         if (!isAdmin(req.query.userId)) return res.status(403).json({ error: 'Denied' });
@@ -135,6 +140,7 @@ app.get('/api/admin/promocodes', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Админ: Создать
 app.post('/api/admin/promocode', async (req, res) => {
     try {
         const { userId, code, discount } = req.body;
@@ -144,6 +150,7 @@ app.post('/api/admin/promocode', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Админ: Удалить
 app.delete('/api/admin/promocode/:id', async (req, res) => {
     try {
         if (!isAdmin(req.headers['user-id'])) return res.status(403).json({ error: 'Denied' });
@@ -153,9 +160,8 @@ app.delete('/api/admin/promocode/:id', async (req, res) => {
 });
 
 
-// --- АДМИНКА (ТОВАРЫ, ЗАКАЗЫ и т.д.) ---
+// --- ЛОГИКА ТОВАРОВ (Админ) ---
 
-// Добавление товара
 app.post('/api/admin/product', upload.single('photo'), async (req, res) => {
     try {
         const { userId, name, category, description, price, purchase_price, stock } = req.body;
@@ -179,7 +185,7 @@ app.post('/api/admin/product', upload.single('photo'), async (req, res) => {
     } catch (err) { console.error(err); res.status(500).json({ error: 'Error adding product' }); }
 });
 
-// Массовый импорт
+// Импорт CSV
 app.post('/api/admin/products/batch', async (req, res) => {
     try {
         const { userId, products } = req.body;
@@ -201,7 +207,7 @@ app.post('/api/admin/products/batch', async (req, res) => {
     } catch (err) { console.error(err); res.status(500).json({ error: 'Batch import error' }); }
 });
 
-// Обновление фото
+// Мастер Фото
 app.post('/api/admin/product/:id/image', upload.single('photo'), async (req, res) => {
     try {
         const userId = req.body.userId;
@@ -218,7 +224,6 @@ app.post('/api/admin/product/:id/image', upload.single('photo'), async (req, res
     } catch (err) { console.error(err); res.status(500).json({ error: 'Image upload error' }); }
 });
 
-// Удаление товара
 app.delete('/api/admin/product/:id', async (req, res) => {
     try {
         const userId = req.headers['user-id']; 
@@ -229,7 +234,6 @@ app.delete('/api/admin/product/:id', async (req, res) => {
     } catch (err) { res.status(500).json({ error: 'Delete error: ' + err.message }); }
 });
 
-// Изменение стока
 app.post('/api/admin/product/stock', async (req, res) => {
     try {
         const { userId, productId, change } = req.body;
@@ -239,7 +243,9 @@ app.post('/api/admin/product/stock', async (req, res) => {
     } catch (err) { res.status(500).json({ error: 'Stock update error' }); }
 });
 
-// Получить заказы (Админ)
+
+// --- ЗАКАЗЫ И СТАТИСТИКА (Админ) ---
+
 app.get('/api/admin/orders', async (req, res) => {
     try {
         const { userId, status } = req.query;
@@ -253,25 +259,23 @@ app.get('/api/admin/orders', async (req, res) => {
     } catch (err) { res.status(500).json({ error: 'Orders error' }); }
 });
 
-// Завершить заказ
+// Завершить заказ (Начисление кешбэка 5%)
 app.post('/api/admin/order/:id/done', async (req, res) => {
     try {
         const { userId } = req.body;
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         
-        // Получаем заказ, чтобы начислить баллы (5% от оплаченной суммы)
         const orderRes = await pool.query("SELECT * FROM orders WHERE id = $1 AND status = 'active'", [req.params.id]);
         if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
-        
         const order = orderRes.rows[0];
-        const items = JSON.parse(order.details);
         
         // Списываем сток
+        const items = JSON.parse(order.details);
         for (const item of items) {
             await pool.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [item.quantity, item.product_id]);
         }
         
-        // Начисляем баллы пользователю (кешбэк 5% от реальной оплаты)
+        // Начисляем баллы (5% от фактически оплаченной суммы)
         const cashback = Math.floor(parseFloat(order.total_price) * 0.05);
         if (cashback > 0) {
             await pool.query('UPDATE users SET points = points + $1 WHERE telegram_id = $2', [cashback, order.user_telegram_id]);
@@ -282,7 +286,6 @@ app.post('/api/admin/order/:id/done', async (req, res) => {
     } catch (err) { res.status(500).json({ error: 'Done error' }); }
 });
 
-// Редактировать заказ
 app.put('/api/admin/order/:id', async (req, res) => {
     try {
         const { userId, address, comment, details, total_price } = req.body;
@@ -295,7 +298,6 @@ app.put('/api/admin/order/:id', async (req, res) => {
     } catch (err) { res.status(500).json({ error: 'Update error' }); }
 });
 
-// Статистика
 app.get('/api/admin/stats', async (req, res) => {
     try {
         const userId = req.query.userId;
@@ -330,8 +332,10 @@ app.post('/api/admin/expense', async (req, res) => {
     } catch (err) { res.status(500).json({ success: false }); }
 });
 
-// DB MANAGER
-const isValidTable = (t) => ['users', 'products', 'expenses', 'faq', 'promocodes'].includes(t); // added promocodes
+
+// --- ПРЯМОЕ УПРАВЛЕНИЕ БД (Универсальное) ---
+const isValidTable = (t) => ['users', 'products', 'expenses', 'faq', 'promocodes'].includes(t);
+
 app.get('/api/admin/db/:table', async (req, res) => {
     try {
         if (!isAdmin(req.query.userId)) return res.status(403).json({ error: 'Denied' });
@@ -377,8 +381,9 @@ app.delete('/api/admin/db/:table/:id', async (req, res) => {
 });
 
 
-// --- STANDARD API ---
-app.get('/', (req, res) => res.send('TripPuff v12 Promo & Points Running'));
+// --- ОБЫЧНОЕ API ---
+app.get('/', (req, res) => res.send('TripPuff v13 Promocodes & Points Ready'));
+
 app.get('/api/image/:fileId', async (req, res) => {
     try {
         const fileLink = await bot.getFileLink(req.params.fileId);
@@ -387,6 +392,7 @@ app.get('/api/image/:fileId', async (req, res) => {
         response.data.pipe(res);
     } catch (e) { res.status(404).send('Not found'); }
 });
+
 app.get('/api/user/:id', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [req.params.id]);
@@ -395,7 +401,7 @@ app.get('/api/user/:id', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// История заказов пользователя
+// История заказов для профиля
 app.get('/api/user/:id/orders', async (req, res) => {
     try {
         const result = await pool.query('SELECT id, total_price, status, created_at, points_used, promocode FROM orders WHERE user_telegram_id = $1 ORDER BY id DESC', [req.params.id]);
@@ -411,6 +417,7 @@ app.post('/api/register', async (req, res) => {
         res.json({ success: true, user: result.rows[0] });
     } catch (err) { res.status(500).json({ success: false }); }
 });
+
 app.get('/api/products', async (req, res) => {
     try { const result = await pool.query('SELECT * FROM products ORDER BY id DESC'); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -445,23 +452,26 @@ app.post('/api/cart/remove', async (req, res) => {
     } catch (err) { res.status(500).json({ error: 'Remove cart error' }); }
 });
 
-// --- ОФОРМЛЕНИЕ ЗАКАЗА (ОБНОВЛЕНО) ---
+
+// --- ОФОРМЛЕНИЕ ЗАКАЗА (Списание баллов и промокоды) ---
 app.post('/api/order', async (req, res) => {
     const client = await pool.connect();
     try {
         const { userId, address, comment, promoCode, usePoints } = req.body;
         
-        await client.query('BEGIN'); // Транзакция
+        await client.query('BEGIN'); // Старт транзакции
 
+        // Получаем юзера
         const userRes = await client.query('SELECT * FROM users WHERE telegram_id = $1', [userId]);
         if (userRes.rows.length === 0) throw new Error('User not found');
         const user = userRes.rows[0];
 
+        // Получаем корзину
         const cartRes = await client.query(`SELECT c.quantity, c.product_id, p.name, p.price FROM cart_items c JOIN products p ON c.product_id = p.id WHERE c.user_telegram_id = $1`, [userId]);
         if (cartRes.rows.length === 0) throw new Error('Cart empty');
         const items = cartRes.rows;
 
-        // 1. Считаем базовую сумму
+        // 1. Базовая сумма
         let initialPrice = 0;
         let itemsListText = '';
         items.forEach(item => { 
@@ -481,18 +491,17 @@ app.post('/api/order', async (req, res) => {
             }
         }
 
-        // 3. Списываем баллы (макс 15% от суммы ПОСЛЕ промокода)
+        // 3. Списываем баллы (Лимит 15% от цены после скидки)
         let pointsToSpend = 0;
         if (usePoints) {
             const maxPoints = Math.floor(priceAfterPromo * 0.15); // Лимит 15%
             pointsToSpend = Math.min(user.points, maxPoints);
-            // Вычитаем баллы из цены
             priceAfterPromo -= pointsToSpend;
         }
 
         const finalPrice = Math.ceil(priceAfterPromo);
 
-        // 4. Формируем текст
+        // 4. Текст для админа
         const userLink = user.username ? `@${user.username}` : `[${user.name}](tg://user?id=${user.telegram_id})`;
         let orderText = `📦 *НОВЫЙ ЗАКАЗ*\n\n👤 *Клиент:* ${userLink}\n📞 *Тел:* ${user.phone}\n`;
         orderText += `\n🛒 *Товары:*\n${itemsListText}`;
@@ -502,13 +511,13 @@ app.post('/api/order', async (req, res) => {
         orderText += `\n\n💰 *ИТОГО К ОПЛАТЕ: ${finalPrice}₽*`;
         orderText += `\n\n📍 *Адрес:* \`${address}\`\n💬 *Коммент:* ${comment || '-'}`;
 
-        // 5. Запись в БД
+        // 5. Запись заказа в БД
         const newOrder = await client.query(
             'INSERT INTO orders (user_telegram_id, details, total_price, initial_price, address, comment, status, points_used, promocode) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id', 
             [userId, JSON.stringify(items), finalPrice, initialPrice, address, comment, 'active', pointsToSpend, promoCode || null]
         );
 
-        // 6. Очистка корзины и списание баллов у юзера
+        // 6. Очистка корзины и списание баллов
         await client.query('DELETE FROM cart_items WHERE user_telegram_id = $1', [userId]);
         if (pointsToSpend > 0) {
             await client.query('UPDATE users SET points = points - $1 WHERE telegram_id = $2', [pointsToSpend, userId]);
@@ -516,6 +525,7 @@ app.post('/api/order', async (req, res) => {
 
         await client.query('COMMIT');
 
+        // Отправка уведомления
         getAdmins().forEach(adminId => { 
             if (adminId) bot.sendMessage(adminId, orderText + `\n🆔 *ID:* ${newOrder.rows[0].id}`, { parse_mode: 'Markdown' }).catch(e => console.error(e)); 
         });
