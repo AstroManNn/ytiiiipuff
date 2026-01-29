@@ -10,13 +10,12 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 👇 ВСТАВЬ СВОЮ ССЫЛКУ на Railway!
+// 👇 ВСТАВЬ СВОЮ ССЫЛКУ!
 const SERVER_URL = 'https://ytiiiipuff-production.up.railway.app'; 
 
 app.use(cors());
 app.use(express.json());
 
-// Настройка Multer (храним фото в памяти)
 const upload = multer({ storage: multer.memoryStorage() });
 
 if (!process.env.DATABASE_URL) console.error("❌ Нет DATABASE_URL");
@@ -30,7 +29,7 @@ const pool = new Pool({
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
-// --- БД: Инициализация и Миграции ---
+// --- БД ---
 const initDB = async () => {
     try {
         const client = await pool.connect();
@@ -85,7 +84,6 @@ const initDB = async () => {
                     status VARCHAR(20) DEFAULT 'active',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
-                -- Таблица ПРОМОКОДОВ
                 CREATE TABLE IF NOT EXISTS promocodes (
                     id SERIAL PRIMARY KEY,
                     code VARCHAR(50) UNIQUE NOT NULL,
@@ -94,16 +92,12 @@ const initDB = async () => {
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             `);
-
-            // Добавляем колонки в таблицу orders, если их нет (для старых БД)
+            // Миграции
             await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS points_used INTEGER DEFAULT 0;`);
             await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS promocode VARCHAR(50);`);
             await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS initial_price DECIMAL(10, 2);`);
-
             console.log('✅ БД готова.');
-        } finally {
-            client.release();
-        }
+        } finally { client.release(); }
     } catch (err) { console.error('❌ Ошибка БД:', err); }
 };
 initDB();
@@ -115,23 +109,15 @@ bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id, 'Привет! Всё управление теперь внутри Mini App.');
 });
 
-
-// --- ЛОГИКА ПРОМОКОДОВ ---
-
-// Проверка промокода (клиент вызывает в корзине)
+// --- API ПРОМОКОДЫ ---
 app.get('/api/promocode/check/:code', async (req, res) => {
     try {
         const { code } = req.params;
         const result = await pool.query("SELECT discount_percent FROM promocodes WHERE code = $1 AND is_active = TRUE", [code.trim()]);
-        if (result.rows.length > 0) {
-            res.json({ success: true, discount: result.rows[0].discount_percent });
-        } else {
-            res.json({ success: false });
-        }
+        if (result.rows.length > 0) res.json({ success: true, discount: result.rows[0].discount_percent });
+        else res.json({ success: false });
     } catch (e) { res.status(500).json({ success: false }); }
 });
-
-// Админ: Получить список
 app.get('/api/admin/promocodes', async (req, res) => {
     try {
         if (!isAdmin(req.query.userId)) return res.status(403).json({ error: 'Denied' });
@@ -139,8 +125,6 @@ app.get('/api/admin/promocodes', async (req, res) => {
         res.json(result.rows);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// Админ: Создать
 app.post('/api/admin/promocode', async (req, res) => {
     try {
         const { userId, code, discount } = req.body;
@@ -149,8 +133,6 @@ app.post('/api/admin/promocode', async (req, res) => {
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// Админ: Удалить
 app.delete('/api/admin/promocode/:id', async (req, res) => {
     try {
         if (!isAdmin(req.headers['user-id'])) return res.status(403).json({ error: 'Denied' });
@@ -159,71 +141,51 @@ app.delete('/api/admin/promocode/:id', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-
-// --- ЛОГИКА ТОВАРОВ (Админ) ---
-
+// --- АДМИНКА (ТОВАРЫ) ---
 app.post('/api/admin/product', upload.single('photo'), async (req, res) => {
     try {
         const { userId, name, category, description, price, purchase_price, stock } = req.body;
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
-
         let internalLink = null;
         if (req.file) {
             const storageChatId = getAdmins()[0]; 
             const photoMsg = await bot.sendPhoto(storageChatId, req.file.buffer, { caption: `New product: ${name}` });
             const fileId = photoMsg.photo[photoMsg.photo.length - 1].file_id;
             internalLink = `${SERVER_URL}/api/image/${fileId}`;
-        } else {
-            internalLink = 'https://via.placeholder.com/300x300.png?text=No+Photo'; 
-        }
-
-        await pool.query(
-            'INSERT INTO products (name, category, description, price, purchase_price, stock, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-            [name, category, description, price, purchase_price || 0, stock || 0, internalLink]
-        );
+        } else internalLink = 'https://via.placeholder.com/300x300.png?text=No+Photo'; 
+        await pool.query('INSERT INTO products (name, category, description, price, purchase_price, stock, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7)', [name, category, description, price, purchase_price || 0, stock || 0, internalLink]);
         res.json({ success: true });
-    } catch (err) { console.error(err); res.status(500).json({ error: 'Error adding product' }); }
+    } catch (err) { res.status(500).json({ error: 'Error' }); }
 });
-
-// Импорт CSV
 app.post('/api/admin/products/batch', async (req, res) => {
     try {
         const { userId, products } = req.body;
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
-        
         const client = await pool.connect();
         try {
             await client.query('BEGIN'); 
             const defaultImage = 'https://via.placeholder.com/300x300.png?text=No+Photo'; 
             for (const p of products) {
-                await client.query(
-                    'INSERT INTO products (name, category, description, price, purchase_price, stock, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-                    [p.name, p.category, p.description || '', p.price, p.purchase_price || 0, p.stock || 0, defaultImage]
-                );
+                await client.query('INSERT INTO products (name, category, description, price, purchase_price, stock, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7)', [p.name, p.category, p.description || '', p.price, p.purchase_price || 0, p.stock || 0, defaultImage]);
             }
             await client.query('COMMIT'); 
             res.json({ success: true, count: products.length });
         } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
-    } catch (err) { console.error(err); res.status(500).json({ error: 'Batch import error' }); }
+    } catch (err) { res.status(500).json({ error: 'Error' }); }
 });
-
-// Мастер Фото
 app.post('/api/admin/product/:id/image', upload.single('photo'), async (req, res) => {
     try {
         const userId = req.body.userId;
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         if (!req.file) return res.status(400).json({ error: 'No photo' });
-
         const storageChatId = getAdmins()[0]; 
         const photoMsg = await bot.sendPhoto(storageChatId, req.file.buffer, { caption: `Updated photo for ID: ${req.params.id}` });
         const fileId = photoMsg.photo[photoMsg.photo.length - 1].file_id;
         const internalLink = `${SERVER_URL}/api/image/${fileId}`;
-
         await pool.query('UPDATE products SET image_url = $1 WHERE id = $2', [internalLink, req.params.id]);
         res.json({ success: true, imageUrl: internalLink });
-    } catch (err) { console.error(err); res.status(500).json({ error: 'Image upload error' }); }
+    } catch (err) { res.status(500).json({ error: 'Error' }); }
 });
-
 app.delete('/api/admin/product/:id', async (req, res) => {
     try {
         const userId = req.headers['user-id']; 
@@ -231,21 +193,18 @@ app.delete('/api/admin/product/:id', async (req, res) => {
         await pool.query('DELETE FROM cart_items WHERE product_id = $1', [req.params.id]);
         await pool.query('DELETE FROM products WHERE id = $1', [req.params.id]);
         res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: 'Delete error: ' + err.message }); }
+    } catch (err) { res.status(500).json({ error: 'Error' }); }
 });
-
 app.post('/api/admin/product/stock', async (req, res) => {
     try {
         const { userId, productId, change } = req.body;
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         await pool.query('UPDATE products SET stock = stock + $1 WHERE id = $2', [parseInt(change), productId]);
         res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: 'Stock update error' }); }
+    } catch (err) { res.status(500).json({ error: 'Error' }); }
 });
 
-
-// --- ЗАКАЗЫ И СТАТИСТИКА (Админ) ---
-
+// --- ЗАКАЗЫ ---
 app.get('/api/admin/orders', async (req, res) => {
     try {
         const { userId, status } = req.query;
@@ -256,48 +215,31 @@ app.get('/api/admin/orders', async (req, res) => {
             return { ...o, user_data: u.rows[0], items: JSON.parse(o.details) };
         }));
         res.json(orders);
-    } catch (err) { res.status(500).json({ error: 'Orders error' }); }
+    } catch (err) { res.status(500).json({ error: 'Error' }); }
 });
-
-// Завершить заказ (Начисление кешбэка 5%)
 app.post('/api/admin/order/:id/done', async (req, res) => {
     try {
         const { userId } = req.body;
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
-        
         const orderRes = await pool.query("SELECT * FROM orders WHERE id = $1 AND status = 'active'", [req.params.id]);
         if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
         const order = orderRes.rows[0];
-        
-        // Списываем сток
         const items = JSON.parse(order.details);
-        for (const item of items) {
-            await pool.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [item.quantity, item.product_id]);
-        }
-        
-        // Начисляем баллы (5% от фактически оплаченной суммы)
-        const cashback = Math.floor(parseFloat(order.total_price) * 0.05);
-        if (cashback > 0) {
-            await pool.query('UPDATE users SET points = points + $1 WHERE telegram_id = $2', [cashback, order.user_telegram_id]);
-        }
-
+        for (const item of items) { await pool.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [item.quantity, item.product_id]); }
+        const cashback = Math.floor(parseFloat(order.total_price) * 0.05); // 5% кешбэк
+        if (cashback > 0) await pool.query('UPDATE users SET points = points + $1 WHERE telegram_id = $2', [cashback, order.user_telegram_id]);
         await pool.query("UPDATE orders SET status = 'completed' WHERE id = $1", [req.params.id]);
         res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: 'Done error' }); }
+    } catch (err) { res.status(500).json({ error: 'Error' }); }
 });
-
 app.put('/api/admin/order/:id', async (req, res) => {
     try {
         const { userId, address, comment, details, total_price } = req.body;
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
-        await pool.query(
-            "UPDATE orders SET address = $1, comment = $2, details = $3, total_price = $4 WHERE id = $5",
-            [address, comment, JSON.stringify(details), total_price, req.params.id]
-        );
+        await pool.query("UPDATE orders SET address = $1, comment = $2, details = $3, total_price = $4 WHERE id = $5", [address, comment, JSON.stringify(details), total_price, req.params.id]);
         res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: 'Update error' }); }
+    } catch (err) { res.status(500).json({ error: 'Error' }); }
 });
-
 app.get('/api/admin/stats', async (req, res) => {
     try {
         const userId = req.query.userId;
@@ -305,7 +247,6 @@ app.get('/api/admin/stats', async (req, res) => {
         const now = new Date();
         const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
         const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
-        
         const ordersRes = await pool.query("SELECT details, total_price FROM orders WHERE status = 'completed' AND created_at >= $1 AND created_at <= $2", [startOfMonth, endOfMonth]);
         let totalRevenue = 0, totalCOGS = 0;
         for (const order of ordersRes.rows) {
@@ -320,9 +261,8 @@ app.get('/api/admin/stats', async (req, res) => {
         let totalExpenses = 0;
         const expensesList = expensesRes.rows.map(e => { totalExpenses += parseFloat(e.amount); return e; });
         res.json({ revenue: totalRevenue, cogs: totalCOGS, expenses: totalExpenses, netProfit: totalRevenue - totalCOGS - totalExpenses, expensesList });
-    } catch (err) { res.status(500).json({ error: 'Stats error' }); }
+    } catch (err) { res.status(500).json({ error: 'Error' }); }
 });
-
 app.post('/api/admin/expense', async (req, res) => {
     try {
         const { userId, amount, comment } = req.body;
@@ -332,10 +272,8 @@ app.post('/api/admin/expense', async (req, res) => {
     } catch (err) { res.status(500).json({ success: false }); }
 });
 
-
-// --- ПРЯМОЕ УПРАВЛЕНИЕ БД (Универсальное) ---
+// --- DB MANAGER ---
 const isValidTable = (t) => ['users', 'products', 'expenses', 'faq', 'promocodes'].includes(t);
-
 app.get('/api/admin/db/:table', async (req, res) => {
     try {
         if (!isAdmin(req.query.userId)) return res.status(403).json({ error: 'Denied' });
@@ -380,10 +318,8 @@ app.delete('/api/admin/db/:table/:id', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-
-// --- ОБЫЧНОЕ API ---
-app.get('/', (req, res) => res.send('TripPuff v13 Promocodes & Points Ready'));
-
+// --- API ---
+app.get('/', (req, res) => res.send('TripPuff v15 Fixed Admin'));
 app.get('/api/image/:fileId', async (req, res) => {
     try {
         const fileLink = await bot.getFileLink(req.params.fileId);
@@ -392,7 +328,6 @@ app.get('/api/image/:fileId', async (req, res) => {
         response.data.pipe(res);
     } catch (e) { res.status(404).send('Not found'); }
 });
-
 app.get('/api/user/:id', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [req.params.id]);
@@ -400,15 +335,13 @@ app.get('/api/user/:id', async (req, res) => {
         else res.status(404).json({ message: 'User not found' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
-
-// История заказов для профиля
+// ИЗМЕНЕНИЕ: Добавлено поле details
 app.get('/api/user/:id/orders', async (req, res) => {
     try {
-        const result = await pool.query('SELECT id, total_price, status, created_at, points_used, promocode FROM orders WHERE user_telegram_id = $1 ORDER BY id DESC', [req.params.id]);
+        const result = await pool.query('SELECT id, total_price, status, created_at, points_used, promocode, details FROM orders WHERE user_telegram_id = $1 ORDER BY id DESC', [req.params.id]);
         res.json(result.rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
-
 app.post('/api/register', async (req, res) => {
     try {
         const { userId, name, phone, username } = req.body;
@@ -417,7 +350,6 @@ app.post('/api/register', async (req, res) => {
         res.json({ success: true, user: result.rows[0] });
     } catch (err) { res.status(500).json({ success: false }); }
 });
-
 app.get('/api/products', async (req, res) => {
     try { const result = await pool.query('SELECT * FROM products ORDER BY id DESC'); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -451,36 +383,20 @@ app.post('/api/cart/remove', async (req, res) => {
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: 'Remove cart error' }); }
 });
-
-
-// --- ОФОРМЛЕНИЕ ЗАКАЗА (Списание баллов и промокоды) ---
 app.post('/api/order', async (req, res) => {
     const client = await pool.connect();
     try {
         const { userId, address, comment, promoCode, usePoints } = req.body;
-        
-        await client.query('BEGIN'); // Старт транзакции
-
-        // Получаем юзера
+        await client.query('BEGIN');
         const userRes = await client.query('SELECT * FROM users WHERE telegram_id = $1', [userId]);
         if (userRes.rows.length === 0) throw new Error('User not found');
         const user = userRes.rows[0];
-
-        // Получаем корзину
         const cartRes = await client.query(`SELECT c.quantity, c.product_id, p.name, p.price FROM cart_items c JOIN products p ON c.product_id = p.id WHERE c.user_telegram_id = $1`, [userId]);
         if (cartRes.rows.length === 0) throw new Error('Cart empty');
         const items = cartRes.rows;
-
-        // 1. Базовая сумма
         let initialPrice = 0;
         let itemsListText = '';
-        items.forEach(item => { 
-            const sum = item.price * item.quantity; 
-            initialPrice += sum; 
-            itemsListText += `- ${item.name} x${item.quantity} = ${sum}₽\n`; 
-        });
-
-        // 2. Применяем промокод
+        items.forEach(item => { const sum = item.price * item.quantity; initialPrice += sum; itemsListText += `- ${item.name} x${item.quantity} = ${sum}₽\n`; });
         let priceAfterPromo = initialPrice;
         let promoDiscountPercent = 0;
         if (promoCode) {
@@ -490,18 +406,13 @@ app.post('/api/order', async (req, res) => {
                 priceAfterPromo = initialPrice * (1 - promoDiscountPercent / 100);
             }
         }
-
-        // 3. Списываем баллы (Лимит 15% от цены после скидки)
         let pointsToSpend = 0;
         if (usePoints) {
-            const maxPoints = Math.floor(priceAfterPromo * 0.15); // Лимит 15%
+            const maxPoints = Math.floor(priceAfterPromo * 0.15); 
             pointsToSpend = Math.min(user.points, maxPoints);
             priceAfterPromo -= pointsToSpend;
         }
-
         const finalPrice = Math.ceil(priceAfterPromo);
-
-        // 4. Текст для админа
         const userLink = user.username ? `@${user.username}` : `[${user.name}](tg://user?id=${user.telegram_id})`;
         let orderText = `📦 *НОВЫЙ ЗАКАЗ*\n\n👤 *Клиент:* ${userLink}\n📞 *Тел:* ${user.phone}\n`;
         orderText += `\n🛒 *Товары:*\n${itemsListText}`;
@@ -510,34 +421,21 @@ app.post('/api/order', async (req, res) => {
         if (pointsToSpend > 0) orderText += `\n💎 *Списано баллов:* ${pointsToSpend}`;
         orderText += `\n\n💰 *ИТОГО К ОПЛАТЕ: ${finalPrice}₽*`;
         orderText += `\n\n📍 *Адрес:* \`${address}\`\n💬 *Коммент:* ${comment || '-'}`;
-
-        // 5. Запись заказа в БД
         const newOrder = await client.query(
             'INSERT INTO orders (user_telegram_id, details, total_price, initial_price, address, comment, status, points_used, promocode) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id', 
             [userId, JSON.stringify(items), finalPrice, initialPrice, address, comment, 'active', pointsToSpend, promoCode || null]
         );
-
-        // 6. Очистка корзины и списание баллов
         await client.query('DELETE FROM cart_items WHERE user_telegram_id = $1', [userId]);
-        if (pointsToSpend > 0) {
-            await client.query('UPDATE users SET points = points - $1 WHERE telegram_id = $2', [pointsToSpend, userId]);
-        }
-
+        if (pointsToSpend > 0) await client.query('UPDATE users SET points = points - $1 WHERE telegram_id = $2', [pointsToSpend, userId]);
         await client.query('COMMIT');
-
-        // Отправка уведомления
         getAdmins().forEach(adminId => { 
             if (adminId) bot.sendMessage(adminId, orderText + `\n🆔 *ID:* ${newOrder.rows[0].id}`, { parse_mode: 'Markdown' }).catch(e => console.error(e)); 
         });
-
         res.json({ success: true });
     } catch (err) { 
         await client.query('ROLLBACK');
         console.error(err);
         res.status(500).json({ success: false, message: err.message }); 
-    } finally {
-        client.release();
-    }
+    } finally { client.release(); }
 });
-
 app.listen(PORT, () => { console.log(`Server running on port ${PORT}`); });
