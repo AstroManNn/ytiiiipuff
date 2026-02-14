@@ -434,20 +434,115 @@ app.post('/api/admin/order/:id/accept', async (req, res) => {
 
 // 4. Завершить заказ
 app.post('/api/admin/order/:id/done', async (req, res) => {
+    const client = await pool.connect();
     try {
-        const { userId } = req.body;
+        const { userId } = (req.body || {});
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
-        const orderRes = await pool.query("SELECT * FROM orders WHERE id = $1 AND status = 'active'", [req.params.id]);
-        if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
-        const orderRow = orderRes.rows[0];
-        const pointsEarned = calcEarnedPoints(orderRow.total_price);
-        // award only for this transition (endpoint работает только для active заказов)
-        if (pointsEarned > 0) {
-            await pool.query('UPDATE users SET points = COALESCE(points, 0) + $1 WHERE telegram_id = $2', [pointsEarned, orderRow.user_telegram_id]);
+
+        const orderId = parseInt(req.params.id, 10);
+        if (!Number.isFinite(orderId)) return res.status(400).json({ error: 'Bad order id' });
+
+        await client.query('BEGIN');
+
+        const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+        if (orderRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Order not found' });
         }
-        await pool.query("UPDATE orders SET status = 'completed', points_awarded = $1 WHERE id = $2", [pointsEarned, req.params.id]);
-        res.json({ success: true, points_awarded: pointsEarned });
-    } catch (err) { res.status(500).json({ error: 'Done error' }); }
+
+        const orderRow = orderRes.rows[0];
+        const status = (orderRow.status || '').toString();
+
+        // Idempotent: if already completed — just return current info.
+        if (status === 'completed') {
+            await client.query('COMMIT');
+            return res.json({
+                success: true,
+                already_completed: true,
+                points_awarded: parseInt(orderRow.points_awarded, 10) || 0
+            });
+        }
+
+        // If order is still pending, allow "done" to auto-accept it:
+        // lock products, check stock, decrement, then complete.
+        let autoAccepted = false;
+        if (status === 'pending') {
+            autoAccepted = true;
+
+            let items = [];
+            try { items = JSON.parse(orderRow.details || '[]'); } catch (e) { items = []; }
+            if (!Array.isArray(items) || items.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'Order is empty' });
+            }
+
+            const productIds = Array.from(new Set(items.map(i => i && i.product_id).filter(Boolean)))
+                .map(x => Number(x))
+                .filter(Boolean);
+
+            const prodRes = await client.query(
+                'SELECT id, stock FROM products WHERE id = ANY($1) FOR UPDATE',
+                [productIds]
+            );
+            const stockMap = new Map(prodRes.rows.map(r => [Number(r.id), parseInt(r.stock, 10) || 0]));
+
+            const 부족 = [];
+            for (const it of items) {
+                const pid = Number(it.product_id);
+                const qty = parseInt(it.quantity, 10) || 0;
+                const stock = stockMap.has(pid) ? stockMap.get(pid) : null;
+                if (!pid || qty <= 0 || stock === null || stock < qty) {
+                    부족.push({ product_id: pid || null, requested: qty, stock: stock === null ? null : stock });
+                }
+            }
+
+            if (부족.length > 0) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({ error: 'OUT_OF_STOCK', details: 부족 });
+            }
+
+            for (const it of items) {
+                const pid = Number(it.product_id);
+                const qty = parseInt(it.quantity, 10) || 0;
+                await client.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [qty, pid]);
+            }
+        } else if (status !== 'active') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'Bad status', status });
+        }
+
+        const alreadyAwarded = parseInt(orderRow.points_awarded, 10) || 0;
+        const pointsEarned = calcEarnedPoints(orderRow.total_price);
+        const toAward = (alreadyAwarded > 0) ? 0 : pointsEarned;
+
+        if (toAward > 0) {
+            await client.query(
+                'UPDATE users SET points = COALESCE(points, 0) + $1 WHERE telegram_id = $2',
+                [toAward, orderRow.user_telegram_id]
+            );
+        }
+
+        const finalAwarded = (alreadyAwarded > 0) ? alreadyAwarded : pointsEarned;
+
+        await client.query(
+            "UPDATE orders SET status = 'completed', points_awarded = $1 WHERE id = $2",
+            [finalAwarded, orderId]
+        );
+
+        await client.query('COMMIT');
+
+        res.json({
+            success: true,
+            points_awarded: finalAwarded,
+            auto_accepted: autoAccepted
+        });
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_e) {}
+        console.error(e);
+        res.status(500).json({ error: 'Done error' });
+    } finally {
+        client.release();
+    }
 });
 
 // 4.1 Принять заказ (списать товар со склада)
